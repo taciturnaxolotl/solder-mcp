@@ -1,8 +1,7 @@
 #!/usr/bin/env bun
 // Solder MCP Server - KiCad/EDA tooling extracted from Solderable
-// Exposes solderlib parsers and KiCad CLI tools via Model Context Protocol
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { readFile } from "fs/promises";
@@ -15,88 +14,238 @@ import { runRemoteAgent } from "./remote-agent";
 
 const server = new McpServer({
   name: "solder-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
-// --- Tool: parse_kicad_schematic ---
-server.tool(
-  "parse_kicad_schematic",
-  "Parse a KiCad schematic file (.kicad_sch) into structured JSON with symbols, wires, labels, and connectivity info",
-  { path: z.string().describe("Path to .kicad_sch file") },
-  async ({ path }) => {
-    const content = await readFile(path, "utf-8");
-    const sch = parseSchematic(content);
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(sch, null, 2) }],
-    };
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+function errorResult(message: string) {
+  return { content: [{ type: "text" as const, text: message }], isError: true };
+}
+
+function jsonResult(data: unknown) {
+  return textResult(JSON.stringify(data, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// Resources: let agents browse project structure without calling tools
+// ---------------------------------------------------------------------------
+
+server.resource(
+  "kicad-file-info",
+  new ResourceTemplate("file://{path}", { list: undefined }),
+  { description: "Metadata and summary for any KiCad file", mimeType: "application/json" },
+  async (uri, params) => {
+    const filePath = (params.path as string).replace(/^\/+/, "/");
+    const content = await readFile(filePath, "utf-8");
+    const ext = filePath.split(".").pop();
+
+    let summary: Record<string, unknown> = { path: filePath, type: ext };
+
+    if (ext === "kicad_sch") {
+      const sch = parseSchematic(content);
+      const realSymbols = sch.symbols.filter((s) => s.ref && !s.ref.startsWith("#"));
+      summary = {
+        ...summary,
+        version: sch.version,
+        component_count: realSymbols.length,
+        wire_count: sch.wires.length,
+        label_count: sch.labels.length,
+        components: realSymbols.map((s) => ({ ref: s.ref, value: s.value, footprint: s.footprint })),
+      };
+    } else if (ext === "kicad_pcb") {
+      const pcb = parsePcb(content);
+      summary = {
+        ...summary,
+        version: pcb.version,
+        footprint_count: pcb.footprints.length,
+        track_count: pcb.tracks.length,
+        net_count: pcb.nets.length,
+      };
+    } else if (ext === "net") {
+      const nl = parseNetlist(content);
+      summary = {
+        ...summary,
+        component_count: nl.components.length,
+        net_count: nl.nets.length,
+      };
+    } else {
+      // Generic S-expression: just show root node and child count
+      const tree = parseSexpr(content);
+      if (Array.isArray(tree)) {
+        summary = { ...summary, root: String(tree[0]), children: tree.length - 1 };
+      }
+    }
+
+    return { contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(summary, null, 2) }] };
   },
 );
 
-// --- Tool: parse_kicad_pcb ---
-server.tool(
-  "parse_kicad_pcb",
-  "Parse a KiCad PCB file (.kicad_pcb) into structured JSON with footprints, tracks, nets, and board info",
-  { path: z.string().describe("Path to .kicad_pcb file") },
-  async ({ path }) => {
-    const content = await readFile(path, "utf-8");
-    const pcb = parsePcb(content);
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(pcb, null, 2) }],
-    };
-  },
-);
+// ---------------------------------------------------------------------------
+// Tools: focused, concise, annotated
+// ---------------------------------------------------------------------------
 
-// --- Tool: parse_netlist ---
 server.tool(
-  "parse_netlist",
-  "Parse a KiCad netlist file (.net or JSON) into structured data with components and nets",
-  { path: z.string().describe("Path to netlist file (.net or .json)") },
+  "kicad_overview",
+  "Get a concise summary of a KiCad file: component counts, net counts, key metadata. Use this FIRST to understand a file before drilling into details.",
+  { path: z.string().describe("Path to any KiCad file (.kicad_sch, .kicad_pcb, .net, .kicad_pro, etc.)") },
+  { readOnlyHint: true, openWorldHint: false },
   async ({ path }) => {
     const content = await readFile(path, "utf-8");
-    const netlist = parseNetlist(content);
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(netlist, null, 2) }],
-    };
-  },
-);
+    const ext = path.split(".").pop();
 
-// --- Tool: parse_sexpr ---
-server.tool(
-  "parse_sexpr",
-  "Parse any KiCad S-expression file into a tree structure. Useful for .kicad_sym, .kicad_pro, fp-lib-table, sym-lib-table, etc.",
-  { path: z.string().describe("Path to any KiCad S-expression file") },
-  async ({ path }) => {
-    const content = await readFile(path, "utf-8");
+    if (ext === "kicad_sch") {
+      const sch = parseSchematic(content);
+      const realSymbols = sch.symbols.filter((s) => s.ref && !s.ref.startsWith("#"));
+      return jsonResult({
+        type: "schematic",
+        version: sch.version,
+        components: realSymbols.length,
+        wires: sch.wires.length,
+        junctions: sch.junctions.length,
+        labels: sch.labels.length,
+        unique_footprints: [...new Set(realSymbols.map((s) => s.footprint).filter(Boolean))].length,
+      });
+    }
+
+    if (ext === "kicad_pcb") {
+      const pcb = parsePcb(content);
+      const layers = new Set([...pcb.tracks.map((t) => t.layer), ...pcb.footprints.map((f) => f.layer)]);
+      return jsonResult({
+        type: "pcb",
+        version: pcb.version,
+        footprints: pcb.footprints.length,
+        tracks: pcb.tracks.length,
+        nets: pcb.nets.length,
+        layers: [...layers].sort(),
+      });
+    }
+
+    if (ext === "net") {
+      const nl = parseNetlist(content);
+      return jsonResult({
+        type: "netlist",
+        components: nl.components.length,
+        nets: nl.nets.length,
+        power_nets: nl.nets.filter((n) => /^(VCC|VDD|GND|VIN|VOUT|\+|-)/i.test(n.name)).map((n) => n.name),
+      });
+    }
+
+    // Fallback: generic S-expression summary
     const tree = parseSexpr(content);
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(tree, null, 2) }],
-    };
+    if (Array.isArray(tree)) {
+      return jsonResult({ type: "sexpr", root: String(tree[0]), top_level_children: tree.length - 1 });
+    }
+    return jsonResult({ type: "atom", value: String(tree) });
   },
 );
 
-// --- Tool: format_sexpr ---
 server.tool(
-  "format_sexpr",
-  "Pretty-print a KiCad S-expression file with proper indentation",
-  { path: z.string().describe("Path to S-expression file to format") },
-  async ({ path }) => {
+  "kicad_components",
+  "List components in a schematic or PCB with ref, value, and footprint. Sorted by reference designator.",
+  {
+    path: z.string().describe("Path to .kicad_sch or .kicad_pcb file"),
+    filter: z.string().optional().describe("Optional regex to filter by ref, value, or footprint (e.g., 'R[0-9]+', 'capacitor')"),
+  },
+  { readOnlyHint: true, openWorldHint: false },
+  async ({ path, filter }) => {
     const content = await readFile(path, "utf-8");
-    const tree = parseSexpr(content);
-    const formatted = stringifySexprPretty(tree);
-    return {
-      content: [{ type: "text" as const, text: formatted }],
-    };
+    const ext = path.split(".").pop();
+    let components: { ref: string; value: string; footprint: string }[] = [];
+
+    if (ext === "kicad_sch") {
+      const sch = parseSchematic(content);
+      components = sch.symbols
+        .filter((s) => s.ref && !s.ref.startsWith("#"))
+        .map((s) => ({ ref: s.ref, value: s.value, footprint: s.footprint }));
+    } else if (ext === "kicad_pcb") {
+      const pcb = parsePcb(content);
+      components = pcb.footprints.map((fp) => ({ ref: fp.ref, value: fp.value, footprint: fp.libId }));
+    } else {
+      return errorResult(`Unsupported file type: .${ext}. Use .kicad_sch or .kicad_pcb.`);
+    }
+
+    if (filter) {
+      const re = new RegExp(filter, "i");
+      components = components.filter((c) => re.test(c.ref) || re.test(c.value) || re.test(c.footprint));
+    }
+
+    components.sort((a, b) => a.ref.localeCompare(b.ref, undefined, { numeric: true }));
+    return jsonResult({ count: components.length, components });
   },
 );
 
-// --- Tool: analyze_netlist_equivalence ---
 server.tool(
-  "analyze_netlist_equivalence",
-  "Compare two netlists (e.g., SKiDL output vs KiCad schematic export) and report differences in nets and connections",
+  "kicad_nets",
+  "Inspect nets in a netlist or schematic. Can list all nets, show connections for a specific net, or find which net a component pin belongs to.",
+  {
+    path: z.string().describe("Path to .net or .kicad_sch file"),
+    net_name: z.string().optional().describe("Show connections for this specific net"),
+    component_ref: z.string().optional().describe("Show all nets connected to this component"),
+  },
+  { readOnlyHint: true, openWorldHint: false },
+  async ({ path, net_name, component_ref }) => {
+    const content = await readFile(path, "utf-8");
+    const ext = path.split(".").pop();
+
+    let nets: { name: string; nodes: { ref: string; pin: string }[] }[] = [];
+
+    if (ext === "net") {
+      const nl = parseNetlist(content);
+      nets = nl.nets.map((n) => ({ name: n.name, nodes: n.nodes.map((nd) => ({ ref: nd.ref, pin: nd.pin })) }));
+    } else if (ext === "kicad_sch") {
+      // Extract net info from schematic labels and wires
+      const sch = parseSchematic(content);
+      const labelNets = sch.labels.map((l) => ({ name: l.text, nodes: [] as { ref: string; pin: string }[] }));
+      return jsonResult({
+        note: "Schematic net extraction shows labels only. For full connectivity, export a netlist first with kicad_export_netlist.",
+        labels: labelNets.map((l) => l.name),
+        global_labels: sch.labels.filter((l) => l.type === "global").map((l) => l.text),
+        hierarchical_labels: sch.labels.filter((l) => l.type === "hierarchical").map((l) => l.text),
+      });
+    } else {
+      return errorResult(`Unsupported file type: .${ext}. Use .net or .kicad_sch.`);
+    }
+
+    if (net_name) {
+      const net = nets.find((n) => n.name === net_name);
+      if (!net) return errorResult(`Net '${net_name}' not found. Available: ${nets.slice(0, 20).map((n) => n.name).join(", ")}${nets.length > 20 ? ` (+${nets.length - 20} more)` : ""}`);
+      return jsonResult({ net: net.name, connections: net.nodes });
+    }
+
+    if (component_ref) {
+      const connected = nets.filter((n) => n.nodes.some((nd) => nd.ref === component_ref));
+      return jsonResult({
+        component: component_ref,
+        nets: connected.map((n) => ({
+          name: n.name,
+          pins: n.nodes.filter((nd) => nd.ref === component_ref).map((nd) => nd.pin),
+        })),
+      });
+    }
+
+    // Summary: just names and connection counts
+    return jsonResult({
+      total_nets: nets.length,
+      nets: nets.map((n) => ({ name: n.name, connections: n.nodes.length })),
+    });
+  },
+);
+
+server.tool(
+  "kicad_compare_netlists",
+  "Compare two netlists and report only differences. Returns a concise diff summary, not full netlists.",
   {
     path_a: z.string().describe("Path to first netlist"),
     path_b: z.string().describe("Path to second netlist"),
   },
+  { readOnlyHint: true, openWorldHint: false },
   async ({ path_a, path_b }) => {
     const [a, b] = await Promise.all([
       readFile(path_a, "utf-8").then(parseNetlist),
@@ -108,167 +257,92 @@ server.tool(
 
     const onlyInA = [...netsA.keys()].filter((k) => !netsB.has(k));
     const onlyInB = [...netsB.keys()].filter((k) => !netsA.has(k));
-    const mismatched: string[] = [];
+    const mismatched: { name: string; diff: string }[] = [];
+
     for (const [name, nodesA] of netsA) {
       const nodesB = netsB.get(name);
       if (!nodesB) continue;
       if (nodesA.size !== nodesB.size || ![...nodesA].every((n) => nodesB.has(n))) {
-        mismatched.push(name);
+        const added = [...nodesB].filter((n) => !nodesA.has(n));
+        const removed = [...nodesA].filter((n) => !nodesB.has(n));
+        const parts: string[] = [];
+        if (added.length) parts.push(`+${added.join(", +")}`);
+        if (removed.length) parts.push(`-${removed.join(", -")}`);
+        mismatched.push({ name, diff: parts.join("; ") });
       }
     }
 
-    const result = {
-      summary: {
-        nets_in_a: netsA.size,
-        nets_in_b: netsB.size,
-        only_in_a: onlyInA.length,
-        only_in_b: onlyInB.length,
-        mismatched_nets: mismatched.length,
-        equivalent: onlyInA.length === 0 && onlyInB.length === 0 && mismatched.length === 0,
-      },
-      only_in_a: onlyInA,
-      only_in_b: onlyInB,
-      mismatched_nets: mismatched.map((name) => ({
-        name,
-        a_nodes: [...(netsA.get(name) ?? [])],
-        b_nodes: [...(netsB.get(name) ?? [])],
-      })),
-    };
-
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-    };
+    const equivalent = onlyInA.length === 0 && onlyInB.length === 0 && mismatched.length === 0;
+    return jsonResult({
+      equivalent,
+      ...(equivalent ? {} : {
+        summary: `${onlyInA.length} nets only in A, ${onlyInB.length} only in B, ${mismatched.length} mismatched`,
+        ...(onlyInA.length ? { only_in_a: onlyInA } : {}),
+        ...(onlyInB.length ? { only_in_b: onlyInB } : {}),
+        ...(mismatched.length ? { mismatched } : {}),
+      }),
+    });
   },
 );
 
-// --- Tool: extract_schematic_components ---
 server.tool(
-  "extract_schematic_components",
-  "Extract a summary of all components in a KiCad schematic: references, values, footprints, and positions",
-  { path: z.string().describe("Path to .kicad_sch file") },
+  "kicad_format_file",
+  "Pretty-print a KiCad S-expression file with proper indentation. Returns the formatted text.",
+  { path: z.string().describe("Path to any KiCad S-expression file") },
+  { readOnlyHint: true, openWorldHint: false },
   async ({ path }) => {
     const content = await readFile(path, "utf-8");
-    const sch = parseSchematic(content);
-    const components = sch.symbols
-      .filter((s) => s.ref && !s.ref.startsWith("#"))
-      .map((s) => ({
-        ref: s.ref,
-        value: s.value,
-        footprint: s.footprint,
-        lib_id: s.libId,
-        position: s.at,
-      }))
-      .sort((a, b) => a.ref.localeCompare(b.ref, undefined, { numeric: true }));
-
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify({ count: components.length, components }, null, 2) }],
-    };
+    const tree = parseSexpr(content);
+    return textResult(stringifySexprPretty(tree));
   },
 );
 
-// --- Tool: extract_pcb_summary ---
 server.tool(
-  "extract_pcb_summary",
-  "Get a high-level summary of a KiCad PCB: footprint count, track count, net count, layers used",
-  { path: z.string().describe("Path to .kicad_pcb file") },
-  async ({ path }) => {
-    const content = await readFile(path, "utf-8");
-    const pcb = parsePcb(content);
-    const layers = new Set<string>();
-    for (const t of pcb.tracks) layers.add(t.layer);
-    for (const fp of pcb.footprints) layers.add(fp.layer);
-
-    const summary = {
-      version: pcb.version,
-      generator: pcb.generator,
-      paper: pcb.paper,
-      footprint_count: pcb.footprints.length,
-      track_count: pcb.tracks.length,
-      net_count: pcb.nets.length,
-      layers_used: [...layers].sort(),
-      footprints: pcb.footprints.map((fp) => ({
-        ref: fp.ref,
-        value: fp.value,
-        footprint: fp.libId,
-        layer: fp.layer,
-        pad_count: fp.pads.length,
-        position: fp.at,
-      })),
-    };
-
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(summary, null, 2) }],
-    };
-  },
-);
-
-// --- Tool: kicad_cli_export_netlist ---
-server.tool(
-  "kicad_cli_export_netlist",
-  "Export a netlist from a KiCad schematic using kicad-cli. Requires kicad-cli to be installed.",
+  "kicad_export_netlist",
+  "Export a netlist from a KiCad schematic using kicad-cli. Requires Bun runtime and kicad-cli installed.",
   {
     schematic_path: z.string().describe("Path to .kicad_sch file"),
-    output_path: z.string().optional().describe("Output path for netlist (default: same dir as schematic with .net extension)"),
+    output_path: z.string().optional().describe("Output path (default: same name with .net extension)"),
   },
+  { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async ({ schematic_path, output_path }) => {
     if (typeof Bun === "undefined") {
-      return {
-        content: [{ type: "text" as const, text: "kicad_cli_export_netlist requires the Bun runtime (uses Bun.spawn)." }],
-        isError: true,
-      };
+      return errorResult("kicad_export_netlist requires the Bun runtime.");
     }
     const outPath = output_path ?? schematic_path.replace(/\.kicad_sch$/, ".net");
     const cliPath = process.env.KICAD_CLI_PATH ?? "kicad-cli";
 
     try {
       const proc = Bun.spawn([cliPath, "sch", "export", "netlist", "--output", outPath, schematic_path], {
-        stdout: "pipe",
-        stderr: "pipe",
+        stdout: "pipe", stderr: "pipe",
       });
       const exitCode = await proc.exited;
-      const stderr = await new Response(proc.stderr).text();
-
       if (exitCode !== 0) {
-        return {
-          content: [{ type: "text" as const, text: `kicad-cli failed (exit ${exitCode}): ${stderr}` }],
-          isError: true,
-        };
+        const stderr = await new Response(proc.stderr).text();
+        return errorResult(`kicad-cli failed (exit ${exitCode}): ${stderr}`);
       }
-
-      const netlistContent = await readFile(outPath, "utf-8");
-      return {
-        content: [{ type: "text" as const, text: `Netlist exported to ${outPath}\n\n${netlistContent}` }],
-      };
+      return textResult(`Netlist exported to ${outPath}`);
     } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Failed to run kicad-cli: ${err instanceof Error ? err.message : String(err)}. Is kicad-cli installed?` }],
-        isError: true,
-      };
+      return errorResult(`Failed to run kicad-cli: ${err instanceof Error ? err.message : String(err)}`);
     }
   },
 );
 
-// --- Tool: compile_skidl ---
 server.tool(
-  "compile_skidl",
-  "Compile a SKiDL Python circuit file to a KiCad netlist. Requires SKiDL runtime to be configured.",
+  "skidl_compile",
+  "Compile a SKiDL Python circuit file to a KiCad netlist. Requires Bun runtime and PATH_TO_SKIDL_RUNTIME env var.",
   {
     script_path: z.string().describe("Path to circuit.py or other SKiDL script"),
-    output_path: z.string().optional().describe("Output netlist path (default: circuit.net in same directory)"),
+    output_path: z.string().optional().describe("Output netlist path (default: same name with .net extension)"),
   },
+  { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async ({ script_path, output_path }) => {
     if (typeof Bun === "undefined") {
-      return {
-        content: [{ type: "text" as const, text: "compile_skidl requires the Bun runtime (uses Bun.spawn)." }],
-        isError: true,
-      };
+      return errorResult("skidl_compile requires the Bun runtime.");
     }
     const skidlBase = process.env.PATH_TO_SKIDL_RUNTIME;
     if (!skidlBase) {
-      return {
-        content: [{ type: "text" as const, text: "PATH_TO_SKIDL_RUNTIME environment variable not set. Configure SKiDL runtime path." }],
-        isError: true,
-      };
+      return errorResult("PATH_TO_SKIDL_RUNTIME environment variable not set.");
     }
 
     const pythonPath = join(skidlBase, "bin", "python3");
@@ -278,93 +352,75 @@ server.tool(
       const proc = Bun.spawn([pythonPath, script_path], {
         cwd: dirname(script_path),
         env: { ...process.env, PYTHONPATH: skidlBase },
-        stdout: "pipe",
-        stderr: "pipe",
+        stdout: "pipe", stderr: "pipe",
       });
       const exitCode = await proc.exited;
-      const stdout = await new Response(proc.stdout).text();
-      const stderr = await new Response(proc.stderr).text();
-
       if (exitCode !== 0) {
-        return {
-          content: [{ type: "text" as const, text: `SKiDL compilation failed (exit ${exitCode}):\n${stderr}` }],
-          isError: true,
-        };
+        const stderr = await new Response(proc.stderr).text();
+        return errorResult(`SKiDL compilation failed (exit ${exitCode}):\n${stderr}`);
       }
-
-      return {
-        content: [{ type: "text" as const, text: `SKiDL compiled successfully.\nStdout: ${stdout}\nNetlist: ${outPath}` }],
-      };
+      return textResult(`Compiled successfully. Netlist: ${outPath}`);
     } catch (err) {
-      return {
-        content: [{ type: "text" as const, text: `Failed to compile SKiDL: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      };
+      return errorResult(`SKiDL compile failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   },
 );
 
-// --- Tool: remote_agent_run ---
 server.tool(
-  "remote_agent_run",
-  "Run a task on the Solderable remote agent server. Gives access to GPT-5.5, Claude Opus 4.8, Claude Fable 5, and a fine-tuned Gemini schematic layout model. Requires a Solderable API key (set SOLDERSLACK_REMOTE_TUI_API_KEY or run `solder /auth`).",
+  "solder_remote_agent",
+  "Run a task on the Solderable remote agent. Access to GPT-5.5, Claude Opus 4.8, Claude Fable 5, fine-tuned Gemini layout model, LCSC component search, SKiDL help, pinout lookup, and sub-agent dispatch. Requires SOLDERSLACK_REMOTE_TUI_API_KEY.",
   {
-    prompt: z.string().describe("The task or question to send to the remote agent"),
-    model: z.string().optional().describe("Model to use (e.g., gpt-5.5-xhigh, opus-4.8-high, fable-5-medium)"),
+    prompt: z.string().describe("Task or question for the remote agent"),
+    model: z.string().optional().describe("Model override (gpt-5.5-xhigh, opus-4.8-high, fable-5-medium)"),
     project_id: z.string().optional().describe("Project ID for context"),
-    timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 300000)"),
+    timeout_ms: z.number().optional().describe("Timeout in ms (default: 300000)"),
   },
+  { readOnlyHint: false, openWorldHint: true },
   async ({ prompt, model, project_id, timeout_ms }) => {
-    const result = await runRemoteAgent({
-      prompt,
-      model,
-      projectId: project_id,
-      timeoutMs: timeout_ms,
-    });
+    const result = await runRemoteAgent({ prompt, model, projectId: project_id, timeoutMs: timeout_ms });
 
     if (!result.success) {
-      return {
-        content: [{ type: "text" as const, text: `Remote agent failed: ${result.error}` }],
-        isError: true,
-      };
+      return errorResult(`Remote agent failed: ${result.error}`);
     }
 
     const parts: string[] = [];
-    if (result.phases.length > 0) {
+
+    // Only show phases if there are meaningful ones (not just boilerplate)
+    const meaningfulPhases = result.phases.filter((p) => p.summary || p.status === "failed");
+    if (meaningfulPhases.length > 0) {
       parts.push("## Phases");
-      for (const phase of result.phases) {
+      for (const phase of meaningfulPhases) {
         const icon = phase.status === "finished" ? "✓" : phase.status === "failed" ? "✗" : "⟳";
         parts.push(`- ${icon} **${phase.label}**: ${phase.summary ?? phase.status}${phase.error ? ` (${phase.error})` : ""}`);
       }
       parts.push("");
     }
 
+    // Show tool calls concisely
     if (result.toolCalls.length > 0) {
       parts.push("## Tools Used");
       for (const tc of result.toolCalls) {
-        parts.push(`### ${tc.name}`);
-        parts.push(`**Input:** \`${JSON.stringify(tc.input).slice(0, 300)}\``);
-        if (tc.output) {
-          parts.push(`**Output:** ${tc.output.slice(0, 1000)}`);
-        }
+        const inputStr = JSON.stringify(tc.input);
+        const outputPreview = tc.output ? tc.output.slice(0, 500) : "(no output)";
+        parts.push(`**${tc.name}**: ${inputStr.length > 200 ? inputStr.slice(0, 200) + "..." : inputStr}`);
+        parts.push(`→ ${outputPreview}`);
         parts.push("");
       }
     }
 
-    parts.push("## Response");
     parts.push(result.finalMessage);
-
-    return {
-      content: [{ type: "text" as const, text: parts.join("\n") }],
-    };
+    return textResult(parts.join("\n"));
   },
 );
 
-// Start server
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("solder-mcp server running on stdio");
+  console.error("solder-mcp v0.2.0 running on stdio");
 }
 
 main().catch((err) => {
