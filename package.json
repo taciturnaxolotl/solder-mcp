@@ -1,0 +1,15 @@
+{
+  "name": "solder-mcp",
+  "version": "0.1.0",
+  "description": "MCP server exposing Solder's KiCad/EDA tooling",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.4"
+  }
+}
