@@ -4,6 +4,7 @@
 import { readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
+import WebSocket from "ws";
 
 const DEFAULT_URL = "wss://sch.up.railway.app/remote-tui";
 const SUBPROTOCOL = "solderslack.remote-tui.v2";
@@ -40,11 +41,9 @@ interface AgentResult {
 }
 
 async function loadApiKey(): Promise<string | undefined> {
-  // Check env first
   if (process.env.SOLDERSLACK_REMOTE_TUI_API_KEY?.trim()) {
     return process.env.SOLDERSLACK_REMOTE_TUI_API_KEY.trim();
   }
-  // Then check stored config
   const configPaths = [
     join(homedir(), ".config", "solderslack", "remote-tui.json"),
     join(homedir(), ".solder", "remote-tui.json"),
@@ -75,13 +74,18 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
     };
   }
 
-  const url = options.url ?? DEFAULT_URL;
-  const timeoutMs = options.timeoutMs ?? 300_000; // 5 min default
+  const baseUrl = options.url ?? DEFAULT_URL;
+  const timeoutMs = options.timeoutMs ?? 300_000;
+  const projectId = options.projectId ?? "mcp-session";
+
+  // Build URL with required project param
+  const wsUrl = new URL(baseUrl);
+  wsUrl.searchParams.set("project", projectId);
 
   return new Promise<AgentResult>((resolve) => {
     const events: AgentEvent[] = [];
     const assistantMessages: string[] = [];
-    const phases: Map<string, { id: string; label: string; status: "running" | "finished" | "failed"; summary?: string; error?: string }> = new Map();
+    const phases = new Map<string, { id: string; label: string; status: "running" | "finished" | "failed"; summary?: string; error?: string }>();
     let sessionId: string | undefined;
     let connected = false;
     let conversationOpened = false;
@@ -90,116 +94,106 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
     const finish = (result: AgentResult) => {
       if (done) return;
       done = true;
+      clearTimeout(timeout);
       try { ws.close(1000, "agent run complete"); } catch {}
       resolve(result);
     };
 
     const timeout = setTimeout(() => {
       finish({
-        success: false,
+        success: assistantMessages.length > 0,
         sessionId,
         events,
         assistantMessages,
         phases: [...phases.values()],
         finalMessage: assistantMessages.at(-1) ?? "",
-        error: `Agent run timed out after ${timeoutMs}ms`,
+        error: assistantMessages.length > 0 ? undefined : `Agent run timed out after ${timeoutMs}ms`,
       });
     }, timeoutMs);
 
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(url, [SUBPROTOCOL], {
-        headers: { Authorization: `Bearer ${apiKey}` },
-      } as any);
-    } catch (err) {
-      clearTimeout(timeout);
-      finish({
-        success: false,
-        events: [],
-        assistantMessages: [],
-        phases: [],
-        finalMessage: "",
-        error: `Failed to create WebSocket: ${err instanceof Error ? err.message : String(err)}`,
-      });
-      return;
-    }
+    const ws = new WebSocket(wsUrl.toString(), [SUBPROTOCOL], {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
 
-    ws.onopen = () => {
+    ws.on("open", () => {
       connected = true;
-    };
+    });
 
-    ws.onmessage = (event) => {
+    ws.on("message", (raw) => {
       if (done) return;
       let msg: any;
       try {
-        msg = JSON.parse(String(event.data));
+        msg = JSON.parse(raw.toString());
       } catch {
         return;
       }
 
       events.push(msg);
 
-      switch (msg.type) {
+      // Unwrap ui.event envelope
+      const inner = msg.type === "ui.event" && msg.event ? msg.event : msg;
+
+      switch (inner.type) {
         case "hello":
-          sessionId = msg.sessionId;
-          // Open conversation
+          sessionId = inner.sessionId ?? msg.sessionId;
           ws.send(JSON.stringify({
             type: "conversation.open",
-            ...(options.projectId ? { projectId: options.projectId } : {}),
+            conversationId: sessionId,
+            projectId,
+            history: [],
+            historyRevision: 0,
+            ...(options.model ? { model: options.model } : {}),
           }));
           break;
 
         case "conversation.opened":
           conversationOpened = true;
-          sessionId = msg.serverRunId ?? sessionId;
-          // Submit the prompt
+          sessionId = inner.serverRunId ?? sessionId;
           ws.send(JSON.stringify({
             type: "chat.submit",
             text: options.prompt,
-            ...(options.projectId ? { projectId: options.projectId } : {}),
+            projectId,
             ...(options.model ? { model: options.model } : {}),
             noAsk: true,
           }));
           break;
 
         case "heartbeat":
-          ws.send(JSON.stringify({ type: "heartbeat_ack", heartbeatId: msg.heartbeatId }));
+          ws.send(JSON.stringify({ type: "heartbeat_ack", heartbeatId: inner.heartbeatId ?? msg.heartbeatId }));
           break;
 
         case "assistant_message":
-          if (msg.text) assistantMessages.push(msg.text);
+          if (inner.text) assistantMessages.push(inner.text);
           break;
 
         case "phase_begin":
-          phases.set(msg.phaseId, { id: msg.phaseId, label: msg.label ?? msg.phaseId, status: "running" });
+          phases.set(inner.phaseId, { id: inner.phaseId, label: inner.label ?? inner.phaseId, status: "running" });
           break;
 
         case "phase_update":
-          if (phases.has(msg.phaseId)) {
-            phases.get(msg.phaseId)!.summary = msg.detail;
+          if (phases.has(inner.phaseId)) {
+            phases.get(inner.phaseId)!.summary = inner.detail;
           }
           break;
 
         case "phase_finish":
-          if (phases.has(msg.phaseId)) {
-            const p = phases.get(msg.phaseId)!;
+          if (phases.has(inner.phaseId)) {
+            const p = phases.get(inner.phaseId)!;
             p.status = "finished";
-            p.summary = msg.summary ?? p.summary;
+            p.summary = inner.summary ?? p.summary;
           }
           break;
 
         case "phase_fail":
-          if (phases.has(msg.phaseId)) {
-            const p = phases.get(msg.phaseId)!;
+          if (phases.has(inner.phaseId)) {
+            const p = phases.get(inner.phaseId)!;
             p.status = "failed";
-            p.error = msg.error;
+            p.error = inner.error;
           }
           break;
 
         case "run_state":
-          // When the agent finishes (busy=false) and we have messages, we're done
-          if (msg.busy === false && conversationOpened && assistantMessages.length > 0) {
-            clearTimeout(timeout);
+          if (inner.busy === false && conversationOpened && assistantMessages.length > 0) {
             finish({
               success: true,
               sessionId,
@@ -212,8 +206,7 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
           break;
 
         case "error":
-          if (msg.code === "unauthorized" || msg.code === "forbidden") {
-            clearTimeout(timeout);
+          if (inner.code === "unauthorized" || inner.code === "forbidden") {
             finish({
               success: false,
               sessionId,
@@ -221,15 +214,31 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
               assistantMessages,
               phases: [...phases.values()],
               finalMessage: "",
-              error: `Authentication failed: ${msg.message ?? msg.code}`,
+              error: `Authentication failed: ${inner.message ?? inner.code}`,
+            });
+          } else if (inner.fatal) {
+            finish({
+              success: assistantMessages.length > 0,
+              sessionId,
+              events,
+              assistantMessages,
+              phases: [...phases.values()],
+              finalMessage: assistantMessages.at(-1) ?? "",
+              error: `Server error: ${inner.message ?? inner.code}`,
             });
           }
           break;
-      }
-    };
 
-    ws.onerror = (err) => {
-      clearTimeout(timeout);
+        // Also extract text from harness events
+        case "harness":
+          if (inner.event?.type === "generation.complete" && inner.event.text) {
+            assistantMessages.push(inner.event.text);
+          }
+          break;
+      }
+    });
+
+    ws.on("error", (err) => {
       finish({
         success: false,
         sessionId,
@@ -237,12 +246,11 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
         assistantMessages,
         phases: [...phases.values()],
         finalMessage: assistantMessages.at(-1) ?? "",
-        error: `WebSocket error: ${(err as any).message ?? String(err)}`,
+        error: `WebSocket error: ${err.message}`,
       });
-    };
+    });
 
-    ws.onclose = (event) => {
-      clearTimeout(timeout);
+    ws.on("close", (code, reason) => {
       if (!done) {
         finish({
           success: assistantMessages.length > 0,
@@ -251,9 +259,9 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
           assistantMessages,
           phases: [...phases.values()],
           finalMessage: assistantMessages.at(-1) ?? "",
-          error: connected ? undefined : `WebSocket closed before connecting: ${event.reason || `code ${event.code}`}`,
+          error: connected ? undefined : `WebSocket closed before connecting: code ${code}`,
         });
       }
-    };
+    });
   });
 }
