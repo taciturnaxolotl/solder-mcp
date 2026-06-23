@@ -4,8 +4,8 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFile } from "fs/promises";
-import { dirname, join } from "path";
+import { readFile, readdir } from "fs/promises";
+import { dirname, join, extname } from "path";
 import { parseSexpr, stringifySexprPretty } from "./sexpr";
 import { parseNetlist } from "./netlist";
 import { parseSchematic } from "./schematic";
@@ -382,6 +382,122 @@ server.tool(
     } catch (err) {
       return errorResult(`SKiDL compile failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  },
+);
+
+server.tool(
+  "kicad_search",
+  "Search across KiCad files in a project directory. Finds components, nets, labels, and raw text matches. Returns concise matches with file paths and context.",
+  {
+    directory: z.string().describe("Project directory to search"),
+    query: z.string().describe("Search term: component ref (R1), value (10k), footprint (0402), net name (GND), or any text"),
+    type: z.enum(["components", "nets", "text", "all"]).optional().describe("Limit search scope (default: all)"),
+  },
+  { readOnlyHint: true, openWorldHint: false },
+  async ({ directory, query, type }) => {
+    const scope = type ?? "all";
+    const kicadExts = new Set([".kicad_sch", ".kicad_pcb", ".net", ".kicad_pro", ".kicad_sym"]);
+    const results: { file: string; type: string; matches: unknown[] }[] = [];
+
+    // Recursively find KiCad files
+    async function findFiles(dir: string): Promise<string[]> {
+      const entries = await readdir(dir, { withFileTypes: true });
+      const files: string[] = [];
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          files.push(...await findFiles(fullPath));
+        } else if (kicadExts.has(extname(entry.name))) {
+          files.push(fullPath);
+        }
+      }
+      return files;
+    }
+
+    let files: string[];
+    try {
+      files = await findFiles(directory);
+    } catch (err) {
+      return errorResult(`Cannot read directory: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (files.length === 0) {
+      return errorResult(`No KiCad files found in ${directory}`);
+    }
+
+    const queryLower = query.toLowerCase();
+
+    for (const filePath of files) {
+      const content = await readFile(filePath, "utf-8");
+      const ext = extname(filePath);
+      const relPath = filePath.startsWith(directory) ? filePath.slice(directory.length).replace(/^[/\\]+/, "") : filePath;
+      const fileMatches: unknown[] = [];
+
+      // Component search
+      if ((scope === "all" || scope === "components") && (ext === ".kicad_sch" || ext === ".kicad_pcb")) {
+        try {
+          if (ext === ".kicad_sch") {
+            const sch = parseSchematic(content);
+            for (const sym of sch.symbols) {
+              if (!sym.ref || sym.ref.startsWith("#")) continue;
+              const haystack = `${sym.ref} ${sym.value} ${sym.footprint} ${sym.libId}`.toLowerCase();
+              if (haystack.includes(queryLower)) {
+                fileMatches.push({ ref: sym.ref, value: sym.value, footprint: sym.footprint, position: sym.at });
+              }
+            }
+          } else {
+            const pcb = parsePcb(content);
+            for (const fp of pcb.footprints) {
+              const haystack = `${fp.ref} ${fp.value} ${fp.libId}`.toLowerCase();
+              if (haystack.includes(queryLower)) {
+                fileMatches.push({ ref: fp.ref, value: fp.value, footprint: fp.libId, layer: fp.layer, position: fp.at });
+              }
+            }
+          }
+        } catch { /* skip unparseable files */ }
+      }
+
+      // Net search
+      if ((scope === "all" || scope === "nets") && ext === ".net") {
+        try {
+          const nl = parseNetlist(content);
+          for (const net of nl.nets) {
+            if (net.name.toLowerCase().includes(queryLower)) {
+              fileMatches.push({ net: net.name, connections: net.nodes.length, nodes: net.nodes.slice(0, 10) });
+            } else {
+              // Check if query matches a component ref within this net
+              const matchingNodes = net.nodes.filter((n) => n.ref.toLowerCase().includes(queryLower));
+              if (matchingNodes.length > 0) {
+                fileMatches.push({ net: net.name, matched_component: query, pins: matchingNodes.map((n) => n.pin) });
+              }
+            }
+          }
+        } catch { /* skip */ }
+      }
+
+      // Raw text search
+      if ((scope === "all" || scope === "text") && fileMatches.length === 0) {
+        const lines = content.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].toLowerCase().includes(queryLower)) {
+            fileMatches.push({ line: i + 1, text: lines[i].trim().slice(0, 200) });
+            if (fileMatches.length >= 20) break; // cap raw text matches
+          }
+        }
+      }
+
+      if (fileMatches.length > 0) {
+        results.push({ file: relPath, type: ext.replace(".", ""), matches: fileMatches });
+      }
+    }
+
+    if (results.length === 0) {
+      return jsonResult({ query, matches: 0, message: `No matches for "${query}" in ${files.length} KiCad files` });
+    }
+
+    const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+    return jsonResult({ query, total_matches: totalMatches, files_searched: files.length, results });
   },
 );
 
