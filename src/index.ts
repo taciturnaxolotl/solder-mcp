@@ -328,6 +328,18 @@ server.tool(
       parts.push("");
     }
 
+    if (result.toolCalls.length > 0) {
+      parts.push("## Tools Used");
+      for (const tc of result.toolCalls) {
+        parts.push(`### ${tc.name}`);
+        parts.push(`**Input:** \`${JSON.stringify(tc.input).slice(0, 300)}\``);
+        if (tc.output) {
+          parts.push(`**Output:** ${tc.output.slice(0, 1000)}`);
+        }
+        parts.push("");
+      }
+    }
+
     parts.push("## Response");
     parts.push(result.finalMessage);
 

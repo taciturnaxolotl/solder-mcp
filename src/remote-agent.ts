@@ -35,6 +35,7 @@ interface AgentResult {
   sessionId?: string;
   events: AgentEvent[];
   assistantMessages: string[];
+  toolCalls: { name: string; input: unknown; output?: string }[];
   phases: { id: string; label: string; status: "running" | "finished" | "failed"; summary?: string; error?: string }[];
   finalMessage: string;
   error?: string;
@@ -68,6 +69,7 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
       success: false,
       events: [],
       assistantMessages: [],
+      toolCalls: [],
       phases: [],
       finalMessage: "",
       error: "No Solderable API key found. Set SOLDERSLACK_REMOTE_TUI_API_KEY or run `solder /auth`.",
@@ -85,8 +87,9 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
   return new Promise<AgentResult>((resolve) => {
     const events: AgentEvent[] = [];
     const assistantMessages: string[] = [];
+    const toolCalls: { name: string; input: unknown; output?: string }[] = [];
     const phases = new Map<string, { id: string; label: string; status: "running" | "finished" | "failed"; summary?: string; error?: string }>();
-    let sessionId: string | undefined;
+    let currentToolCall: { name: string; input: unknown } | null = null;    let sessionId: string | undefined;
     let connected = false;
     let conversationOpened = false;
     let done = false;
@@ -105,7 +108,9 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
         sessionId,
         events,
         assistantMessages,
+        toolCalls,
         phases: [...phases.values()],
+        toolCalls,
         finalMessage: assistantMessages.at(-1) ?? "",
         error: assistantMessages.length > 0 ? undefined : `Agent run timed out after ${timeoutMs}ms`,
       });
@@ -200,6 +205,7 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
               events,
               assistantMessages,
               phases: [...phases.values()],
+        toolCalls,
               finalMessage: assistantMessages.at(-1) ?? "",
             });
           }
@@ -213,6 +219,7 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
               events,
               assistantMessages,
               phases: [...phases.values()],
+        toolCalls,
               finalMessage: "",
               error: `Authentication failed: ${inner.message ?? inner.code}`,
             });
@@ -223,16 +230,32 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
               events,
               assistantMessages,
               phases: [...phases.values()],
+        toolCalls,
               finalMessage: assistantMessages.at(-1) ?? "",
               error: `Server error: ${inner.message ?? inner.code}`,
             });
           }
           break;
 
-        // Also extract text from harness events
+        // Also extract text and tool calls from harness events
         case "harness":
           if (inner.event?.type === "generation.complete" && inner.event.text) {
             assistantMessages.push(inner.event.text);
+          } else if (inner.event?.type === "tool_call.begin") {
+            currentToolCall = { name: inner.event.toolName, input: inner.event.args ?? inner.event.input };
+          } else if (inner.event?.type === "tool_call.complete") {
+            const result = inner.event.result ?? inner.event.output;
+            if (currentToolCall && currentToolCall.name === inner.event.toolName) {
+              currentToolCall.output = typeof result === "string" ? result : JSON.stringify(result);
+              toolCalls.push(currentToolCall);
+              currentToolCall = null;
+            } else {
+              toolCalls.push({
+                name: inner.event.toolName,
+                input: inner.event.args ?? inner.event.input,
+                output: typeof result === "string" ? result : JSON.stringify(result),
+              });
+            }
           }
           break;
       }
@@ -245,6 +268,7 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
         events,
         assistantMessages,
         phases: [...phases.values()],
+        toolCalls,
         finalMessage: assistantMessages.at(-1) ?? "",
         error: `WebSocket error: ${err.message}`,
       });
@@ -258,6 +282,7 @@ export async function runRemoteAgent(options: AgentRunOptions): Promise<AgentRes
           events,
           assistantMessages,
           phases: [...phases.values()],
+        toolCalls,
           finalMessage: assistantMessages.at(-1) ?? "",
           error: connected ? undefined : `WebSocket closed before connecting: code ${code}`,
         });
