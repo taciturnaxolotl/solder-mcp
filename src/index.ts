@@ -5,13 +5,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFile, writeFile, stat } from "fs/promises";
-import { existsSync } from "fs";
-import { join, dirname, basename, resolve } from "path";
-import { parseSexpr, stringifySexpr, stringifySexprPretty, getChildAtom, getAllChildren } from "./sexpr";
-import { parseNetlist, type NetlistDocument } from "./netlist";
-import { parseSchematic, type Schematic } from "./schematic";
-import { parsePcb, type PcbBoard } from "./pcb";
+import { readFile } from "fs/promises";
+import { dirname, join } from "path";
+import { parseSexpr, stringifySexprPretty } from "./sexpr";
+import { parseNetlist } from "./netlist";
+import { parseSchematic } from "./schematic";
+import { parsePcb } from "./pcb";
 import { runRemoteAgent } from "./remote-agent";
 
 const server = new McpServer({
@@ -212,6 +211,12 @@ server.tool(
     output_path: z.string().optional().describe("Output path for netlist (default: same dir as schematic with .net extension)"),
   },
   async ({ schematic_path, output_path }) => {
+    if (typeof Bun === "undefined") {
+      return {
+        content: [{ type: "text" as const, text: "kicad_cli_export_netlist requires the Bun runtime (uses Bun.spawn)." }],
+        isError: true,
+      };
+    }
     const outPath = output_path ?? schematic_path.replace(/\.kicad_sch$/, ".net");
     const cliPath = process.env.KICAD_CLI_PATH ?? "kicad-cli";
 
@@ -252,6 +257,12 @@ server.tool(
     output_path: z.string().optional().describe("Output netlist path (default: circuit.net in same directory)"),
   },
   async ({ script_path, output_path }) => {
+    if (typeof Bun === "undefined") {
+      return {
+        content: [{ type: "text" as const, text: "compile_skidl requires the Bun runtime (uses Bun.spawn)." }],
+        isError: true,
+      };
+    }
     const skidlBase = process.env.PATH_TO_SKIDL_RUNTIME;
     if (!skidlBase) {
       return {
