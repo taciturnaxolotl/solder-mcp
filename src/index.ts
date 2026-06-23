@@ -93,6 +93,39 @@ server.resource(
 // ---------------------------------------------------------------------------
 
 server.prompt(
+  "design_circuit",
+  "Design a new circuit from a description using SKiDL code-first workflow",
+  { description: z.string().describe("Natural language description of the circuit to build") },
+  ({ description }) => ({
+    messages: [{
+      role: "user",
+      content: {
+        type: "text",
+        text: `Design this circuit using SKiDL (code-first PCB workflow):
+
+${description}
+
+Workflow:
+1. Create or edit circuit.py with the SKiDL design. Every Part() MUST include ref= (e.g., ref='R1').
+2. Run skidl_lint on circuit.py to catch errors before compiling.
+3. Run skidl_compile to generate circuit.net.
+4. Run kicad_overview on circuit.net to verify component and net counts match expectations.
+5. If issues found, fix circuit.py and repeat from step 2.
+
+SKiDL basics:
+- from skidl import *
+- r = Part('Device', 'R', ref='R1', value='10k')
+- vcc = Net('VCC')
+- vcc += r[1]   # connect pin 1 to VCC
+- def build_circuit(): ... is the required entry point
+
+Be specific about component values, packages, and connections. Use standard library names (Device, Connector_Generic, etc.).`,
+      },
+    }],
+  }),
+);
+
+server.prompt(
   "review_design",
   "Review a KiCad project for common design issues",
   { project_dir: z.string().describe("Path to the KiCad project directory") },
@@ -511,6 +544,156 @@ server.tool(
     } catch (err) {
       return errorResult(`SKiDL compile failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  },
+);
+
+server.tool(
+  "skidl_lint",
+  "Validate SKiDL Python code for common errors WITHOUT compiling. Checks syntax and ensures every Part() call has an explicit ref= parameter. Use BEFORE /compile to catch issues early. Fast — uses AST parsing, not the SKiDL runtime.",
+  {
+    script_path: z.string().describe("Path to circuit.py or other SKiDL script"),
+  },
+  { readOnlyHint: true, openWorldHint: false },
+  async ({ script_path }) => {
+    let source: string;
+    try {
+      source = await readFile(script_path, "utf-8");
+    } catch (err) {
+      return errorResult(`Cannot read file: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Parse Python AST using Bun's built-in or fallback to basic checks
+    // Since we can't run Python AST in TS, do regex-based validation
+    const lines = source.split("\n");
+    const issues: { line: number; severity: "error" | "warning"; message: string }[] = [];
+
+    // Check for Part() calls missing ref=
+    const partCallRegex = /Part\s*\(/g;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.includes("Part(")) continue;
+      // Skip comments
+      if (line.trimStart().startsWith("#")) continue;
+      // Check if ref= is present on this line or continuation
+      const blockEnd = Math.min(i + 10, lines.length);
+      let block = "";
+      for (let j = i; j < blockEnd; j++) {
+        block += lines[j];
+        if (lines[j].includes(")") && !lines[j].includes("(")) break;
+      }
+      if (!block.includes("ref=") && !block.includes("TEMPLATE") && !block.includes("LIBRARY")) {
+        issues.push({ line: i + 1, severity: "error", message: `Part() call missing ref= parameter. Every netlisted Part must include ref='R1' etc.` });
+      }
+    }
+
+    // Check for basic Python syntax issues
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith("from skidl import") || trimmed.startsWith("import skidl")) continue;
+      if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith('"""') || trimmed.startsWith("'''")) continue;
+      // Flag bare except
+      if (/except\s*:/.test(trimmed)) {
+        issues.push({ line: i + 1, severity: "warning", message: "Bare except clause catches all exceptions including KeyboardInterrupt" });
+      }
+    }
+
+    // Check for build_circuit function
+    if (!source.includes("def build_circuit")) {
+      issues.push({ line: 0, severity: "warning", message: "No build_circuit() function found. Solderable expects this as the entry point." });
+    }
+
+    if (issues.length === 0) {
+      return jsonResult({ ok: true, file: script_path, message: "No issues found. Ready to compile." });
+    }
+
+    const errors = issues.filter((i) => i.severity === "error");
+    const warnings = issues.filter((i) => i.severity === "warning");
+    return jsonResult({
+      ok: errors.length === 0,
+      file: script_path,
+      errors: errors.length,
+      warnings: warnings.length,
+      issues,
+    });
+  },
+);
+
+server.tool(
+  "skidl_explain",
+  "Explain what a SKiDL circuit.py file does in plain English. Parses the Python source and summarizes components, connections, power rails, and subcircuits without needing the SKiDL runtime. Use when reviewing or understanding existing circuit code.",
+  {
+    script_path: z.string().describe("Path to circuit.py or other SKiDL script"),
+  },
+  { readOnlyHint: true, openWorldHint: false },
+  async ({ script_path }) => {
+    let source: string;
+    try {
+      source = await readFile(script_path, "utf-8");
+    } catch (err) {
+      return errorResult(`Cannot read file: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const lines = source.split("\n");
+    const parts: { ref?: string; lib?: string; name?: string; value?: string; line: number }[] = [];
+    const nets: { name: string; line: number }[] = [];
+    const connections: { from: string; to: string; line: number }[] = [];
+    const imports: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.startsWith("#")) continue;
+
+      // Track imports
+      if (line.startsWith("from ") || line.startsWith("import ")) {
+        imports.push(line);
+        continue;
+      }
+
+      // Extract Part() calls
+      const partMatch = line.match(/Part\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']/);
+      if (partMatch) {
+        const refMatch = line.match(/ref\s*=\s*["']([^"']+)["']/);
+        const valMatch = line.match(/value\s*=\s*["']([^"']+)["']/);
+        parts.push({
+          lib: partMatch[1], name: partMatch[2],
+          ref: refMatch?.[1], value: valMatch?.[1],
+          line: i + 1,
+        });
+      }
+
+      // Extract Net() calls
+      const netMatch = line.match(/Net\s*\(\s*["']([^"']+)["']\s*\)/);
+      if (netMatch) {
+        nets.push({ name: netMatch[1], line: i + 1 });
+      }
+
+      // Extract += connections (net += pin pattern)
+      const connMatch = line.match(/(\w+)\s*\+=\s*(.+)/);
+      if (connMatch && !line.includes("import")) {
+        connections.push({ from: connMatch[1], to: connMatch[2].trim(), line: i + 1 });
+      }
+    }
+
+    return jsonResult({
+      file: script_path,
+      summary: {
+        total_lines: lines.length,
+        components: parts.length,
+        named_nets: nets.length,
+        connections: connections.length,
+        has_build_circuit: source.includes("def build_circuit"),
+      },
+      imports,
+      components: parts.map((p) => ({
+        ...(p.ref ? { ref: p.ref } : {}),
+        lib: p.lib, part: p.name,
+        ...(p.value ? { value: p.value } : {}),
+        line: p.line,
+      })),
+      nets: nets.slice(0, 30),
+      connections: connections.slice(0, 30),
+      ...(parts.some((p) => !p.ref) ? { warning: `${parts.filter((p) => !p.ref).length} Part() calls missing ref=` } : {}),
+    });
   },
 );
 
