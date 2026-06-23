@@ -93,15 +93,19 @@ server.resource(
 
 server.tool(
   "kicad_overview",
-  "Get a concise summary of a KiCad file: component counts, net counts, key metadata. Use this FIRST to understand a file before drilling into details.",
-  { path: z.string().describe("Path to any KiCad file (.kicad_sch, .kicad_pcb, .net, .kicad_pro, etc.)") },
+  "Get a summary of a KiCad file. By default returns concise counts and metadata. Pass detail=true for the full parsed structure (all properties, coordinates, raw data). Use the summary FIRST, then detail=true only when you need specific fields not in the summary.",
+  {
+    path: z.string().describe("Path to any KiCad file (.kicad_sch, .kicad_pcb, .net, .kicad_pro, etc.)"),
+    detail: z.boolean().optional().describe("Return full parsed structure instead of summary (default: false)"),
+  },
   { readOnlyHint: true, openWorldHint: false },
-  async ({ path }) => {
+  async ({ path, detail }) => {
     const content = await readFile(path, "utf-8");
     const ext = path.split(".").pop();
 
     if (ext === "kicad_sch") {
       const sch = parseSchematic(content);
+      if (detail) return jsonResult(sch);
       const realSymbols = sch.symbols.filter((s) => s.ref && !s.ref.startsWith("#"));
       return jsonResult({
         type: "schematic",
@@ -116,6 +120,7 @@ server.tool(
 
     if (ext === "kicad_pcb") {
       const pcb = parsePcb(content);
+      if (detail) return jsonResult(pcb);
       const layers = new Set([...pcb.tracks.map((t) => t.layer), ...pcb.footprints.map((f) => f.layer)]);
       return jsonResult({
         type: "pcb",
@@ -129,6 +134,7 @@ server.tool(
 
     if (ext === "net") {
       const nl = parseNetlist(content);
+      if (detail) return jsonResult(nl);
       return jsonResult({
         type: "netlist",
         components: nl.components.length,
@@ -137,8 +143,9 @@ server.tool(
       });
     }
 
-    // Fallback: generic S-expression summary
+    // Generic S-expression
     const tree = parseSexpr(content);
+    if (detail) return jsonResult(tree);
     if (Array.isArray(tree)) {
       return jsonResult({ type: "sexpr", root: String(tree[0]), top_level_children: tree.length - 1 });
     }
@@ -148,36 +155,48 @@ server.tool(
 
 server.tool(
   "kicad_components",
-  "List components in a schematic or PCB with ref, value, and footprint. Sorted by reference designator.",
+  "List components in a schematic or PCB with ref, value, and footprint. Pass detail=true to include all properties, positions, and pad info.",
   {
     path: z.string().describe("Path to .kicad_sch or .kicad_pcb file"),
     filter: z.string().optional().describe("Optional regex to filter by ref, value, or footprint (e.g., 'R[0-9]+', 'capacitor')"),
+    detail: z.boolean().optional().describe("Include all properties, positions, pads (default: false)"),
   },
   { readOnlyHint: true, openWorldHint: false },
-  async ({ path, filter }) => {
+  async ({ path, filter, detail }) => {
     const content = await readFile(path, "utf-8");
     const ext = path.split(".").pop();
-    let components: { ref: string; value: string; footprint: string }[] = [];
 
     if (ext === "kicad_sch") {
       const sch = parseSchematic(content);
-      components = sch.symbols
-        .filter((s) => s.ref && !s.ref.startsWith("#"))
-        .map((s) => ({ ref: s.ref, value: s.value, footprint: s.footprint }));
-    } else if (ext === "kicad_pcb") {
+      let symbols = sch.symbols.filter((s) => s.ref && !s.ref.startsWith("#"));
+      if (filter) {
+        const re = new RegExp(filter, "i");
+        symbols = symbols.filter((s) => re.test(s.ref) || re.test(s.value) || re.test(s.footprint));
+      }
+      symbols.sort((a, b) => a.ref.localeCompare(b.ref, undefined, { numeric: true }));
+      if (detail) return jsonResult({ count: symbols.length, components: symbols });
+      return jsonResult({
+        count: symbols.length,
+        components: symbols.map((s) => ({ ref: s.ref, value: s.value, footprint: s.footprint })),
+      });
+    }
+
+    if (ext === "kicad_pcb") {
       const pcb = parsePcb(content);
-      components = pcb.footprints.map((fp) => ({ ref: fp.ref, value: fp.value, footprint: fp.libId }));
-    } else {
-      return errorResult(`Unsupported file type: .${ext}. Use .kicad_sch or .kicad_pcb.`);
+      let fps = pcb.footprints;
+      if (filter) {
+        const re = new RegExp(filter, "i");
+        fps = fps.filter((fp) => re.test(fp.ref) || re.test(fp.value) || re.test(fp.libId));
+      }
+      fps.sort((a, b) => a.ref.localeCompare(b.ref, undefined, { numeric: true }));
+      if (detail) return jsonResult({ count: fps.length, components: fps });
+      return jsonResult({
+        count: fps.length,
+        components: fps.map((fp) => ({ ref: fp.ref, value: fp.value, footprint: fp.libId })),
+      });
     }
 
-    if (filter) {
-      const re = new RegExp(filter, "i");
-      components = components.filter((c) => re.test(c.ref) || re.test(c.value) || re.test(c.footprint));
-    }
-
-    components.sort((a, b) => a.ref.localeCompare(b.ref, undefined, { numeric: true }));
-    return jsonResult({ count: components.length, components });
+    return errorResult(`Unsupported file type: .${ext}. Use .kicad_sch or .kicad_pcb.`);
   },
 );
 
