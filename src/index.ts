@@ -7,7 +7,7 @@ import { z } from "zod";
 import { readFile, readdir } from "fs/promises";
 import { dirname, join, extname } from "path";
 import { parseSexpr, stringifySexprPretty } from "./sexpr";
-import { parseNetlist } from "./netlist";
+import { parseNetlist, type NetlistDocument } from "./netlist";
 import { parseSchematic } from "./schematic";
 import { parsePcb } from "./pcb";
 import { runRemoteAgent } from "./remote-agent";
@@ -694,6 +694,66 @@ server.tool(
       connections: connections.slice(0, 30),
       ...(parts.some((p) => !p.ref) ? { warning: `${parts.filter((p) => !p.ref).length} Part() calls missing ref=` } : {}),
     });
+  },
+);
+
+server.tool(
+  "kicad_fix_v10_sheets",
+  "Fix KiCad 9→10 migration issue where hierarchical sheet (at X Y 0) blocks fail to parse. Strips the trailing rotation arg from top-level sheet (at ...) expressions while leaving symbol/property/pin (at ...) untouched. Run this after /schematic if KiCad 10 refuses to open the file.",
+  { path: z.string().describe("Path to .kicad_sch file to fix") },
+  { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  async ({ path }) => {
+    let content: string;
+    try {
+      content = await readFile(path, "utf-8");
+    } catch (err) {
+      return errorResult(`Cannot read file: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Match top-level sheet blocks: lines starting with \t(sheet followed by (at X Y 0)
+    // We need to be careful to only match sheet-level (at ...) not nested ones
+    const lines = content.split("\n");
+    let fixes = 0;
+    let inSheetBlock = false;
+    let sheetDepth = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trimStart();
+
+      // Track when we enter/exit a top-level sheet block
+      if (trimmed.startsWith("(sheet") && !trimmed.startsWith("(sheets")) {
+        inSheetBlock = true;
+        sheetDepth = 1;
+        // Check if (at ...) is on this same line or next few lines
+        continue;
+      }
+
+      if (inSheetBlock) {
+        // Count parens to track depth
+        for (const ch of trimmed) {
+          if (ch === "(") sheetDepth++;
+          if (ch === ")") sheetDepth--;
+        }
+        if (sheetDepth <= 0) {
+          inSheetBlock = false;
+          continue;
+        }
+
+        // Only fix (at ...) at depth 2 (direct child of sheet block)
+        // Sheet children are indented with two tabs typically
+        if (sheetDepth === 2 && /^\(at\s+[\d.-]+\s+[\d.-]+\s+0\s*\)$/.test(trimmed)) {
+          lines[i] = lines[i].replace(/\(at\s+([\d.-]+)\s+([\d.-]+)\s+0\s*\)/, "(at $1 $2)");
+          fixes++;
+        }
+      }
+    }
+
+    if (fixes === 0) {
+      return jsonResult({ fixed: false, message: "No sheet-level (at X Y 0) expressions found. File may already be KiCad 10 compatible." });
+    }
+
+    await Bun.write(path, lines.join("\n"));
+    return jsonResult({ fixed: true, fixes, path, message: `Fixed ${fixes} sheet (at ...) expression(s) for KiCad 10 compatibility.` });
   },
 );
 
